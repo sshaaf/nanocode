@@ -1,6 +1,6 @@
 # nanocode
 
-Minimal Claude Code alternative. Single Python file, zero dependencies, ~250 lines.
+Minimal Claude Code alternative. Single Java file, runnable with [jbang](https://jbang.dev), zero..eh..1 json dependency, ~390 lines.
 
 Built using Claude Code, then used to build itself.
 
@@ -17,7 +17,7 @@ Built using Claude Code, then used to build itself.
 
 ```bash
 export ANTHROPIC_API_KEY="your-key"
-python nanocode.py
+jbang nanocode.java
 ```
 
 ### OpenRouter
@@ -26,7 +26,7 @@ Use [OpenRouter](https://openrouter.ai) to access any model:
 
 ```bash
 export OPENROUTER_API_KEY="your-key"
-python nanocode.py
+jbang nanocode.java
 ```
 
 To use a different model:
@@ -34,7 +34,7 @@ To use a different model:
 ```bash
 export OPENROUTER_API_KEY="your-key"
 export MODEL="openai/gpt-5.2"
-python nanocode.py
+jbang nanocode.java
 ```
 
 ## Commands
@@ -60,10 +60,10 @@ python nanocode.py
 ❯ what files are here?
 ────────────────────────────────────────
 
-⏺ Glob(**/*.py)
-  ⎿  nanocode.py
+⏺ Glob(**/*.java)
+  ⎿  nanocode.java
 
-⏺ There's one Python file: nanocode.py
+⏺ There's one Java file: nanocode.java
 ```
 
 ## License
