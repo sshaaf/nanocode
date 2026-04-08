@@ -1,11 +1,32 @@
 ///usr/bin/env jbang "$0" "$@" ; exit $?
 //JAVA 25+
 //DEPS com.fasterxml.jackson.core:jackson-databind:2.18.2
+//DEPS org.eclipse.lsp4j:org.eclipse.lsp4j:0.24.0
+//SOURCES JavaLspSupport.java
 
 import module java.base;
 
 import static java.lang.System.getenv;
 import static java.nio.file.Files.*;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,12 +40,47 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 static final ObjectMapper JSON = new ObjectMapper();
 
-static final String OPENROUTER_KEY = getenv("OPENROUTER_API_KEY");
-static final String API_URL = OPENROUTER_KEY != null
-        ? "https://openrouter.ai/api/v1/messages"
-        : "https://api.anthropic.com/v1/messages";
-static final String MODEL = Optional.ofNullable(getenv("MODEL"))
-        .orElse(OPENROUTER_KEY != null ? "anthropic/claude-opus-4.5" : "claude-opus-4-5");
+// Tool result constants
+static final String RESULT_OK = "ok";
+static final String RESULT_NONE = "none";
+static final String RESULT_EMPTY = "(empty)";
+static final String ERROR_PREFIX = "error: ";
+
+// Provider detection - computed once
+enum Provider {
+    ANTHROPIC("https://api.anthropic.com/v1/messages", "claude-opus-4-5"),
+    OPENROUTER("https://openrouter.ai/api/v1/messages", "anthropic/claude-opus-4.5"),
+    OPENAI("https://api.openai.com/v1/chat/completions", "gpt-4o");
+
+    final String url;
+    final String defaultModel;
+
+    Provider(String url, String defaultModel) {
+        this.url = url;
+        this.defaultModel = defaultModel;
+    }
+
+    static Provider detect() {
+        String orKey = getenv("OPENROUTER_API_KEY");
+        String oaKey = getenv("OPENAI_API_KEY");
+        if (orKey != null && !orKey.isBlank())
+            return OPENROUTER;
+        if (oaKey != null && !oaKey.isBlank())
+            return OPENAI;
+        return ANTHROPIC;
+    }
+}
+
+static final Provider PROVIDER = Provider.detect();
+static final String MODEL = Optional.ofNullable(getenv("MODEL")).orElseGet(() -> PROVIDER.defaultModel);
+
+static String getApiKey() {
+    return switch (PROVIDER) {
+        case OPENROUTER -> getenv("OPENROUTER_API_KEY");
+        case OPENAI -> getenv("OPENAI_API_KEY");
+        case ANTHROPIC -> getenv("ANTHROPIC_API_KEY");
+    };
+}
 
 static final String RESET = "\033[0m", BOLD = "\033[1m", DIM = "\033[2m";
 static final String BLUE = "\033[34m", CYAN = "\033[36m", GREEN = "\033[32m", RED = "\033[31m";
@@ -34,15 +90,14 @@ static final String BLUE = "\033[34m", CYAN = "\033[36m", GREEN = "\033[32m", RE
 static String toolRead(JsonNode args) throws IOException {
     var lines = readAllLines(Path.of(args.get("path").asText()));
     int offset = args.path("offset").asInt(0), limit = args.path("limit").asInt(lines.size());
-    var sb = new StringBuilder();
-    for (int i = offset; i < Math.min(offset + limit, lines.size()); i++)
-        sb.append("%4d| %s%n".formatted(i + 1, lines.get(i)));
-    return sb.toString();
+    return IntStream.range(offset, Math.min(offset + limit, lines.size()))
+            .mapToObj(i -> "%4d| %s".formatted(i + 1, lines.get(i)))
+            .collect(Collectors.joining("\n"));
 }
 
 static String toolWrite(JsonNode args) throws IOException {
     writeString(Path.of(args.get("path").asText()), args.get("content").asText());
-    return "ok";
+    return RESULT_OK;
 }
 
 static String toolEdit(JsonNode args) throws IOException {
@@ -51,32 +106,39 @@ static String toolEdit(JsonNode args) throws IOException {
     var old = args.get("old").asText();
     var repl = args.get("new").asText();
     if (!text.contains(old))
-        return "error: old_string not found";
-    int count = (text.length() - text.replace(old, "").length()) / old.length();
+        return ERROR_PREFIX + "old_string not found";
+    // Efficient counting: split and count parts
+    int count = text.split(Pattern.quote(old), -1).length - 1;
     if (!args.path("all").asBoolean() && count > 1)
-        return "error: old_string appears " + count + " times, must be unique (use all=true)";
+        return ERROR_PREFIX + "old_string appears " + count + " times, must be unique (use all=true)";
     writeString(path, args.path("all").asBoolean()
             ? text.replace(old, repl)
             : text.replaceFirst(Pattern.quote(old), Matcher.quoteReplacement(repl)));
-    return "ok";
+    return RESULT_OK;
 }
 
 static String toolGlob(JsonNode args) throws IOException {
     var base = Path.of(args.path("path").asText("."));
     var matcher = FileSystems.getDefault().getPathMatcher("glob:" + base + "/" + args.get("pat").asText());
     if (!exists(base))
-        return "none";
+        return RESULT_NONE;
+    record FileWithTime(Path path, FileTime mtime) {}
     try (var walk = walk(base)) {
-        var files = walk.filter(Files::isRegularFile).filter(matcher::matches)
-                .sorted((a, b) -> {
+        var files = walk.filter(Files::isRegularFile)
+                .filter(matcher::matches)
+                .map(p -> {
                     try {
-                        return getLastModifiedTime(b).compareTo(getLastModifiedTime(a));
+                        return new FileWithTime(p, getLastModifiedTime(p));
                     } catch (IOException e) {
-                        return 0;
+                        throw new UncheckedIOException(e);
                     }
                 })
-                .map(Path::toString).toList();
-        return files.isEmpty() ? "none" : String.join("\n", files);
+                .sorted((a, b) -> b.mtime.compareTo(a.mtime))
+                .map(f -> f.path.toString())
+                .toList();
+        return files.isEmpty() ? RESULT_NONE : String.join("\n", files);
+    } catch (UncheckedIOException e) {
+        throw e.getCause();
     }
 }
 
@@ -91,11 +153,25 @@ static String toolGrep(JsonNode args) throws IOException {
                 for (int i = 0; i < lines.size() && hits.size() < 50; i++)
                     if (pattern.matcher(lines.get(i)).find())
                         hits.add(file + ":" + (i + 1) + ":" + lines.get(i));
-            } catch (Exception e) {
-                /* skip */ }
+            } catch (Exception ignored) {
+                /* skip unreadable files */ }
         });
     }
-    return hits.isEmpty() ? "none" : String.join("\n", hits);
+    return hits.isEmpty() ? RESULT_NONE : String.join("\n", hits);
+}
+
+static String toolJavaDefinition(JsonNode args) throws Exception {
+    return JavaLspSupport.definition(args.get("path").asText(), args.path("line").asInt(1),
+            args.path("column").asInt(1));
+}
+
+static String toolJavaHover(JsonNode args) throws Exception {
+    return JavaLspSupport.hover(args.get("path").asText(), args.path("line").asInt(1),
+            args.path("column").asInt(1));
+}
+
+static String toolJavaDiagnostics(JsonNode args) throws Exception {
+    return JavaLspSupport.diagnostics(args.path("path").asText(""));
 }
 
 static String toolBash(JsonNode args) throws Exception {
@@ -112,10 +188,10 @@ static String toolBash(JsonNode args) throws Exception {
         proc.destroyForcibly();
         out.add("(timed out after 30s)");
     }
-    return out.isEmpty() ? "(empty)" : String.join("\n", out);
+    return out.isEmpty() ? RESULT_EMPTY : String.join("\n", out);
 }
 
-static String runTool(String name, JsonNode args) {
+static String runTool(String name, JsonNode args, boolean javaLsp) {
     try {
         return switch (name) {
             case "read" -> toolRead(args);
@@ -124,77 +200,219 @@ static String runTool(String name, JsonNode args) {
             case "glob" -> toolGlob(args);
             case "grep" -> toolGrep(args);
             case "bash" -> toolBash(args);
-            default -> "error: unknown tool " + name;
+            case "java_definition" -> {
+                if (!javaLsp)
+                    yield ERROR_PREFIX + "Java LSP not enabled";
+                yield toolJavaDefinition(args);
+            }
+            case "java_hover" -> {
+                if (!javaLsp)
+                    yield ERROR_PREFIX + "Java LSP not enabled";
+                yield toolJavaHover(args);
+            }
+            case "java_diagnostics" -> {
+                if (!javaLsp)
+                    yield ERROR_PREFIX + "Java LSP not enabled";
+                yield toolJavaDiagnostics(args);
+            }
+            default -> ERROR_PREFIX + "unknown tool " + name;
         };
     } catch (Exception e) {
-        return "error: " + e.getMessage();
+        return ERROR_PREFIX + e.getMessage();
     }
 }
 
 // --- Schema ---
 
-static final String SCHEMA = """
+static final String SCHEMA_BASE = """
         [{"name":"read","description":"Read file with line numbers (file path, not directory)","input_schema":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]}},
         {"name":"write","description":"Write content to file","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
         {"name":"edit","description":"Replace old with new in file (old must be unique unless all=true)","input_schema":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"all":{"type":"boolean"}},"required":["path","old","new"]}},
-        {"name":"glob","description":"Find files by pattern, sorted by mtime","input_schema":{"type":"object","properties":{"pat":{"type":"string"},"path":{"type":"string"}},"required":["pat"]}},
+        {"name":"glob","description":"Find files matching glob pat under path (default .). pat is NOT recursive unless you use ** (e.g. **/*.java, **/AbstractCommand.java)","input_schema":{"type":"object","properties":{"pat":{"type":"string"},"path":{"type":"string"}},"required":["pat"]}},
         {"name":"grep","description":"Search files for regex pattern","input_schema":{"type":"object","properties":{"pat":{"type":"string"},"path":{"type":"string"}},"required":["pat"]}},
         {"name":"bash","description":"Run shell command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}]""";
 
+static final String SCHEMA_JAVA_LSP = """
+        [{"name":"java_definition","description":"Go to where a symbol is declared (navigation). Use for where is X defined — NOT for what type is X (use java_hover). path: prefer short workspace-relative path e.g. src/main/java/.../Foo.java. line/column: 1-based, cursor on the symbol","input_schema":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"column":{"type":"integer"}},"required":["path"]}},
+        {"name":"java_hover","description":"Type, signature, Javadoc, enum constant docs at cursor — use for what type is this, what does this field/enum constant mean in source, explain this identifier in the project. path: prefer workspace-relative. line/column: 1-based; put column on the identifier","input_schema":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"column":{"type":"integer"}},"required":["path"]}},
+        {"name":"java_diagnostics","description":"Java compiler/LSP errors and warnings; omit path for all cached diagnostics","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]""";
+
+static ArrayNode toolsSchema(boolean javaLsp) throws IOException {
+    var schema = (ArrayNode) JSON.readTree(SCHEMA_BASE);
+    if (javaLsp) {
+        for (var n : JSON.readTree(SCHEMA_JAVA_LSP))
+            schema.add(n);
+    }
+    return schema;
+}
+
 // --- API ---
 
-static JsonNode callApi(ArrayNode messages, String systemPrompt) throws IOException {
+static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(30))
+        .build();
+
+static ArrayNode anthropicToolsToOpenAi(ArrayNode anthropicTools) {
+    var out = JSON.createArrayNode();
+    for (JsonNode t : anthropicTools) {
+        var fn = JSON.createObjectNode();
+        fn.put("name", t.get("name").asText());
+        fn.put("description", t.get("description").asText());
+        fn.set("parameters", t.get("input_schema"));
+        var tool = JSON.createObjectNode();
+        tool.put("type", "function");
+        tool.set("function", fn);
+        out.add(tool);
+    }
+    return out;
+}
+
+static JsonNode callOpenAi(ArrayNode conversationMessages, String systemPrompt, ArrayNode openAiTools)
+        throws IOException, InterruptedException {
+    var fullMessages = JSON.createArrayNode();
+    fullMessages.add(JSON.createObjectNode().put("role", "system").put("content", systemPrompt));
+    fullMessages.addAll(conversationMessages);
+    var body = JSON.createObjectNode();
+    body.put("model", MODEL);
+    body.put("max_tokens", 8192);
+    body.set("messages", fullMessages);
+    body.set("tools", openAiTools);
+    body.put("tool_choice", "auto");
+
+    var request = HttpRequest.newBuilder()
+            .uri(URI.create(PROVIDER.url))
+            .timeout(Duration.ofSeconds(60))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer " + getApiKey())
+            .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)))
+            .build();
+
+    var resp = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+    var response = JSON.readTree(resp.body());
+    if (resp.statusCode() >= 400)
+        throw new IOException("API error " + resp.statusCode() + ": " + response);
+    return response;
+}
+
+static JsonNode callApi(ArrayNode messages, String systemPrompt, ArrayNode tools)
+        throws IOException, InterruptedException {
     var body = JSON.createObjectNode().put("model", MODEL).put("max_tokens", 8192).put("system", systemPrompt);
     body.set("messages", messages);
-    body.set("tools", JSON.readTree(SCHEMA));
+    body.set("tools", tools);
 
-    var conn = (HttpURLConnection) URI.create(API_URL).toURL().openConnection();
-    conn.setRequestMethod("POST");
-    conn.setDoOutput(true);
-    conn.setRequestProperty("Content-Type", "application/json");
-    conn.setRequestProperty("anthropic-version", "2023-06-01");
-    conn.setRequestProperty(OPENROUTER_KEY != null ? "Authorization" : "x-api-key",
-            OPENROUTER_KEY != null ? "Bearer " + OPENROUTER_KEY
-                    : Optional.ofNullable(getenv("ANTHROPIC_API_KEY")).orElse(""));
+    var requestBuilder = HttpRequest.newBuilder()
+            .uri(URI.create(PROVIDER.url))
+            .timeout(Duration.ofSeconds(60))
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", "2023-06-01");
 
-    try (var os = conn.getOutputStream()) {
-        os.write(JSON.writeValueAsBytes(body));
+    if (PROVIDER == Provider.OPENROUTER) {
+        requestBuilder.header("Authorization", "Bearer " + getApiKey());
+    } else {
+        requestBuilder.header("x-api-key", getApiKey());
     }
-    int status = conn.getResponseCode();
-    var response = JSON.readTree(status >= 400 ? conn.getErrorStream() : conn.getInputStream());
-    if (status >= 400)
-        throw new IOException("API error " + status + ": " + response);
+
+    var request = requestBuilder
+            .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)))
+            .build();
+
+    var resp = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+    var response = JSON.readTree(resp.body());
+    if (resp.statusCode() >= 400)
+        throw new IOException("API error " + resp.statusCode() + ": " + response);
     return response;
 }
 
 // --- UI ---
 
-static String sep() {
+static int cachedTermWidth = -1;
+
+static int getTermWidth() {
+    if (cachedTermWidth > 0)
+        return cachedTermWidth;
     try {
         var p = new ProcessBuilder("tput", "cols").redirectErrorStream(true).start();
-        return DIM + "─".repeat(Math.min(Integer.parseInt(new String(p.getInputStream().readAllBytes()).trim()), 80))
-                + RESET;
+        cachedTermWidth = Math.min(Integer.parseInt(new String(p.getInputStream().readAllBytes()).trim()), 80);
     } catch (Exception e) {
-        return DIM + "─".repeat(80) + RESET;
+        cachedTermWidth = 80;
     }
+    return cachedTermWidth;
+}
+
+static String sep() {
+    return DIM + "─".repeat(getTermWidth()) + RESET;
 }
 
 static String preview(String s, int max) {
-    var lines = s.split("\n");
-    var p = lines[0].substring(0, Math.min(lines[0].length(), max));
-    return lines.length > 1 ? p + " ... +" + (lines.length - 1) + " lines" : (lines[0].length() > max ? p + "..." : p);
+    int newlineIdx = s.indexOf('\n');
+    String firstLine = newlineIdx == -1 ? s : s.substring(0, newlineIdx);
+    String preview = firstLine.substring(0, Math.min(firstLine.length(), max));
+
+    if (newlineIdx != -1) {
+        int lineCount = (int) s.chars().filter(ch -> ch == '\n').count();
+        return preview + " ... +" + lineCount + " lines";
+    }
+    return firstLine.length() > max ? preview + "..." : preview;
+}
+
+/** Terminal line for tool call — prefer full `path` tail so long dirs are not misleadingly truncated. */
+static String toolArgsPreview(JsonNode toolArgs) {
+    if (toolArgs == null || !toolArgs.isObject())
+        return "";
+    var path = toolArgs.path("path").asText("");
+    if (!path.isBlank()) {
+        int max = 76;
+        if (path.length() <= max)
+            return path;
+        return "…" + path.substring(path.length() - (max - 1));
+    }
+    var it = toolArgs.fields();
+    if (!it.hasNext())
+        return "";
+    var s = it.next().getValue().asText("");
+    int m = 56;
+    return s.length() <= m ? s : s.substring(0, m - 1) + "…";
 }
 
 // --- Main ---
 
 void main(String[] args) throws Exception {
     var cwd = System.getProperty("user.dir");
-    System.out.println(BOLD + "nanocode" + RESET + " | " + DIM + MODEL + " ("
-            + (OPENROUTER_KEY != null ? "OpenRouter" : "Anthropic") + ") | " + cwd + RESET + "\n");
+    System.out.println(BOLD + "nanocode" + RESET + " | " + DIM + MODEL + " (" + PROVIDER + ") | " + cwd + RESET + "\n");
 
     var messages = JSON.createArrayNode();
-    var systemPrompt = "Concise coding assistant. cwd: " + cwd;
+    String systemPrompt = "Concise coding assistant. cwd: " + cwd
+            + " When the user names types, files, methods, or enum constants that could exist in this workspace, prefer read/glob and (if Java LSP is on) java_hover to ground the answer in the repo — not generic product docs alone.";
     var stdin = new BufferedReader(new InputStreamReader(System.in));
+
+    boolean javaLspEnabled = false;
+    var cwdPath = Path.of(cwd);
+    if (JavaLspSupport.workspaceHasJavaFiles(cwdPath) && !"1".equals(System.getenv("NANOCODE_NO_JAVA_LSP"))) {
+        boolean want = "1".equals(System.getenv("NANOCODE_JAVA_LSP"));
+        if (!want) {
+            System.out.print(DIM + "This workspace contains .java files. Download & enable Java LSP (JDT, ~50MB once)? [y/N] "
+                    + RESET);
+            System.out.flush();
+            var y = stdin.readLine();
+            want = y != null && y.strip().equalsIgnoreCase("y");
+        }
+        if (want) {
+            try {
+                JavaLspSupport.installIfNeeded(msg -> System.out.println(DIM + "  " + msg + RESET));
+                JavaLspSupport.start(cwdPath, msg -> System.out.println(DIM + "  " + msg + RESET));
+                javaLspEnabled = true;
+                systemPrompt += " Java LSP (JDT): java_definition = go to declaration; java_hover = type/Javadoc/docs at cursor (what type, what a field or enum constant is in this code — not only \"what type\" phrasing); java_diagnostics = compile issues. Line/column 1-based."
+                        + " Prefer workspace-relative paths for read and java_* (src/main/java/.../Foo.java), not long absolute paths that may get cut off."
+                        + " For glob from repo root use ** for recursive, e.g. **/AbstractCommand.java or **/*.java.";
+                System.out.println(GREEN + "⏺ Java LSP enabled" + RESET + "\n");
+            } catch (Exception e) {
+                System.out.println(RED + "⏺ Java LSP failed: " + e.getMessage() + RESET + "\n");
+            }
+        }
+    }
+
+    var tools = toolsSchema(javaLspEnabled);
+    var openAiTools = PROVIDER == Provider.OPENAI ? anthropicToolsToOpenAi(tools) : null;
 
     while (true) {
         try {
@@ -219,37 +437,65 @@ void main(String[] args) throws Exception {
             messages.add(JSON.createObjectNode().put("role", "user").put("content", input));
 
             while (true) {
-                var response = callApi(messages, systemPrompt);
-                var content = response.get("content");
-                var toolResults = JSON.createArrayNode();
-
-                for (var block : content) {
-                    if ("text".equals(block.get("type").asText()))
-                        System.out.println("\n" + CYAN + "⏺" + RESET + " "
-                                + block.get("text").asText().replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
-
-                    if ("tool_use".equals(block.get("type").asText())) {
-                        var name = block.get("name").asText();
-                        var toolArgs = block.get("input");
-                        var argPreview = toolArgs.fields().hasNext() ? toolArgs.fields().next().getValue().asText()
-                                : "";
-                        System.out
-                                .println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0)) + name.substring(1)
-                                        + RESET + "(" + DIM + argPreview.substring(0, Math.min(50, argPreview.length()))
-                                        + RESET + ")");
-
-                        var result = runTool(name, toolArgs);
-                        System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
-
-                        toolResults.add(JSON.createObjectNode().put("type", "tool_result")
-                                .put("tool_use_id", block.get("id").asText()).put("content", result));
+                if (PROVIDER == Provider.OPENAI) {
+                    var response = callOpenAi(messages, systemPrompt, openAiTools);
+                    var msg = response.get("choices").get(0).get("message");
+                    if (msg.has("content") && !msg.get("content").isNull()) {
+                        var txt = msg.get("content").asText().strip();
+                        if (!txt.isEmpty())
+                            System.out.println("\n" + CYAN + "⏺" + RESET + " "
+                                    + txt.replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
                     }
-                }
+                    var tc = msg.get("tool_calls");
+                    if (tc == null || !tc.isArray() || tc.isEmpty()) {
+                        messages.add(msg.deepCopy());
+                        break;
+                    }
+                    messages.add(msg.deepCopy());
+                    for (var toolCall : tc) {
+                        var id = toolCall.get("id").asText();
+                        var fn = toolCall.get("function");
+                        var name = fn.get("name").asText();
+                        var argStr = fn.path("arguments").asText("");
+                        var toolArgs = argStr.isBlank() ? JSON.createObjectNode() : JSON.readTree(argStr);
+                        var argPreview = toolArgsPreview(toolArgs);
+                        System.out.println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0)) + name.substring(1)
+                                + RESET + "(" + DIM + argPreview + RESET + ")");
+                        var result = runTool(name, toolArgs, javaLspEnabled);
+                        System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
+                        messages.add(JSON.createObjectNode().put("role", "tool").put("tool_call_id", id)
+                                .put("content", result));
+                    }
+                } else {
+                    var response = callApi(messages, systemPrompt, tools);
+                    var content = response.get("content");
+                    var toolResults = JSON.createArrayNode();
 
-                messages.add(JSON.createObjectNode().put("role", "assistant").<ObjectNode>set("content", content));
-                if (toolResults.isEmpty())
-                    break;
-                messages.add(JSON.createObjectNode().put("role", "user").<ObjectNode>set("content", toolResults));
+                    for (var block : content) {
+                        if ("text".equals(block.get("type").asText()))
+                            System.out.println("\n" + CYAN + "⏺" + RESET + " "
+                                    + block.get("text").asText().replaceAll("\\*\\*(.+?)\\*\\*", BOLD + "$1" + RESET));
+
+                        if ("tool_use".equals(block.get("type").asText())) {
+                            var name = block.get("name").asText();
+                            var toolArgs = block.get("input");
+                            var argPreview = toolArgsPreview(toolArgs);
+                            System.out.println("\n" + GREEN + "⏺ " + Character.toUpperCase(name.charAt(0))
+                                    + name.substring(1) + RESET + "(" + DIM + argPreview + RESET + ")");
+
+                            var result = runTool(name, toolArgs, javaLspEnabled);
+                            System.out.println("  " + DIM + "⎿  " + preview(result, 60) + RESET);
+
+                            toolResults.add(JSON.createObjectNode().put("type", "tool_result")
+                                    .put("tool_use_id", block.get("id").asText()).put("content", result));
+                        }
+                    }
+
+                    messages.add(JSON.createObjectNode().put("role", "assistant").<ObjectNode>set("content", content.deepCopy()));
+                    if (toolResults.isEmpty())
+                        break;
+                    messages.add(JSON.createObjectNode().put("role", "user").<ObjectNode>set("content", toolResults));
+                }
             }
             System.out.println();
         } catch (Exception e) {
