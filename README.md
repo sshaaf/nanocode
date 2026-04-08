@@ -4,7 +4,7 @@ Minimal Claude Code alternative. Single Java file, runnable with [jbang](https:/
 
 Built using Claude Code, then used to build itself.
 
-![screenshot](screenshot.png)
+![screenshot](screenshot.jpg)
 
 ## Features
 
